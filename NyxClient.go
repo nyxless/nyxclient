@@ -234,8 +234,7 @@ func (this *NyxClient) Request(method string, params any, opts ...grpc.CallOptio
 		}
 	}
 
-	options.Headers["appid"] = this.appid
-	options.Headers["secret"] = this.secret
+	options.Headers["Authorization"] = "Bearer " + x.GenRpcToken(this.appid, this.secret)
 
 	var ctx context.Context
 	if options.Ctx != nil {
@@ -332,10 +331,12 @@ func (this *NyxClient) process(r *pb.ReplyData) (map[string]any, error) { //{{{
 		switch t {
 		case "BYTES":
 			res[v] = r.Values[k]
+		case "STRING":
+			res[v] = string(r.Values[k])
 		case "JSON":
 			res[v] = x.JsonDecode(r.Values[k])
 		default:
-			res[v] = string(r.Values[k])
+			res[v] = x.AsString(r.Values[k])
 		}
 	}
 
