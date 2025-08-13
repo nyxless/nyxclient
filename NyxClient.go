@@ -10,6 +10,7 @@ import (
 	"github.com/nyxless/nyx/x/log"
 	"github.com/nyxless/nyx/x/pb"
 	"github.com/nyxless/nyxclient/rpc"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"strconv"
@@ -45,6 +46,7 @@ var (
 
 var nyxclient_instance = map[string]*NyxClient{}
 var mutex sync.RWMutex
+var group singleflight.Group
 
 // 设置参数MaxIdleConns, 支持方法: NewNyxClient
 func WithMaxIdleConns(mic int) grpc.DialOption { // {{{
@@ -141,19 +143,6 @@ func NewNyxClient(address, appid, secret string, opts ...grpc.DialOption) (*NyxC
 } // }}}
 
 func newNyxClient(address, appid, secret string, opts ...grpc.DialOption) (*NyxClient, error) { //{{{
-	logger := x.Logger
-	if logger == nil { //如果在nyx框架项目中，直接使用x.logger的配置
-		logger = log.NewLogger()
-		logger.SetLevel(log.LevelCustom)
-
-		fwriter, err := log.NewFileWriter("logs", "nyxclient-2006-01-02.log")
-		if err != nil {
-			return nil, err
-		}
-
-		logger.AddWriter(fwriter, "nyxclient") //使用自定义日志名:nyxclient
-	}
-
 	options := &rpc.RpcOptions{
 		MaxIdleConns: DefaultMaxIdleConns,
 		MaxOpenConns: DefaultMaxOpenConns,
@@ -185,6 +174,15 @@ func newNyxClient(address, appid, secret string, opts ...grpc.DialOption) (*NyxC
 		options.MaxIdleConns = options.MaxOpenConns
 	}
 
+	logger := x.Logger
+	if logger == nil { //如果在nyx框架项目中，直接使用x.logger的配置
+		var err error
+		logger, err = getLogger()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	rpclient, err := rpc.New(address, options.MaxIdleConns, options.MaxOpenConns, grpc_opts)
 	if err != nil {
 		logger.Log("nyxclient", err)
@@ -212,6 +210,30 @@ func newNyxClient(address, appid, secret string, opts ...grpc.DialOption) (*NyxC
 	return nyxclient, nil
 } // }}}
 
+func getLogger() (*log.Logger, error) { // {{{
+	logger, err := log.NewLogger()
+	if err != nil {
+		return nil, err
+	}
+
+	logger.SetLevel(log.LevelCustom)
+
+	fwriter, err := log.NewFileWriter("logs", "nyxclient-2006-01-02.log")
+	if err != nil {
+		return nil, err
+	}
+
+	fwriter_err, err := log.NewFileWriter("logs", "nyxclient-err-2006-01-02.log")
+	if err != nil {
+		return nil, err
+	}
+
+	logger.AddWriter(fwriter, "nyxclient")         //使用自定义日志名:nyxclient
+	logger.AddWriter(fwriter_err, "nyxclient-err") //使用自定义日志名:nyxclient
+
+	return logger, nil
+} // }}}
+
 func (this *NyxClient) Request(method string, params any, opts ...grpc.CallOption) (*Response, error) { // {{{
 	var data map[string]any
 	var err error
@@ -234,7 +256,10 @@ func (this *NyxClient) Request(method string, params any, opts ...grpc.CallOptio
 		}
 	}
 
-	options.Headers["Authorization"] = "Bearer " + x.GenRpcToken(this.appid, this.secret)
+	options.Headers["Appid"] = this.appid
+	options.Headers["Nonce"] = x.AsString(x.RandUint32())
+	options.Headers["Timestamp"] = x.AsString(x.Now())
+	options.Headers["Authorization"] = "Bearer " + x.Sha256(options.Headers["Appid"]+options.Headers["Nonce"]+options.Headers["Timestamp"], this.secret)
 
 	var ctx context.Context
 	if options.Ctx != nil {
@@ -250,7 +275,7 @@ func (this *NyxClient) Request(method string, params any, opts ...grpc.CallOptio
 	}
 
 	if options.Headers["guid"] == "" {
-		options.Headers["guid"] = x.RandStr(32)
+		options.Headers["guid"] = x.GetUUID()
 	}
 
 	if options.Timeout > 0 {
@@ -269,27 +294,55 @@ func (this *NyxClient) Request(method string, params any, opts ...grpc.CallOptio
 	var response *Response
 	var reply *pb.Reply
 	var header, trailer metadata.MD
-
-	if options.UseCache && this.cache != nil {
-		if cache_data, found := this.getFromCache(method, data); found {
-			reply = cache_data.Reply
-			header = cache_data.Header
-			trailer = cache_data.Trailer
-		}
-	}
+	var cache_key []byte
+	var hit_cache bool
+	var real bool
 
 	start_time := time.Now()
 
-	if reply == nil {
+	if options.UseCache && this.cache != nil {
+		cache_key = this.getCacheKey(method, data)
+		cache_data, found := this.getFromCache(cache_key)
+		if !found {
+			result, err, _ := group.Do(string(cache_key), func() (interface{}, error) {
+				grpc_opts = append(grpc_opts, grpc.Header(&header), grpc.Trailer(&trailer))
+				reply, err = this.rpc.Request(ctx, method, data, grpc_opts)
+				if nil != err {
+					this.logger.Log("nyxclient", err, map[string]any{"appid": this.appid, "uri": method, "options": options}, data)
+					return nil, err
+				}
+
+				cache_data := &cacheData{reply, header, trailer}
+
+				if reply.Code == 0 { // 返回成功时，更新缓存
+					this.setCache(cache_key, cache_data, options.CacheTtl)
+				}
+
+				real = true
+
+				return cache_data, nil
+			})
+
+			if nil != err {
+				return nil, err
+			}
+
+			hit_cache = !real
+			cache_data = result.(*cacheData)
+		} else {
+			hit_cache = true
+		}
+
+		reply = cache_data.Reply
+		header = cache_data.Header
+		trailer = cache_data.Trailer
+
+	} else {
 		grpc_opts = append(grpc_opts, grpc.Header(&header), grpc.Trailer(&trailer))
 		reply, err = this.rpc.Request(ctx, method, data, grpc_opts)
 		if nil != err {
 			this.logger.Log("nyxclient", err, map[string]any{"appid": this.appid, "uri": method, "options": options}, data)
 			return nil, err
-		}
-
-		if options.UseCache && this.cache != nil {
-			this.setCache(method, data, &cacheData{reply, header, trailer}, options.CacheTtl)
 		}
 	}
 
@@ -302,11 +355,11 @@ func (this *NyxClient) Request(method string, params any, opts ...grpc.CallOptio
 		return nil, err
 	}
 
-	consume_t := int(time.Now().Sub(start_time).Nanoseconds() / 1000 / 1000)
+	consume_t := int(time.Since(start_time).Milliseconds())
 
-	this.logger.Log("nyxclient", map[string]any{"appid": this.appid, "uri": method}, data, map[string]any{"code": code, "consume_t": consume_t, "consume": consume, "data": res, "msg": msg, "time": server_time})
+	this.logger.Log("nyxclient", map[string]any{"appid": this.appid, "uri": method, "cache": hit_cache}, data, map[string]any{"code": code, "consume_t": consume_t, "consume": consume, "data": res, "msg": msg, "time": server_time})
 	if code > 0 {
-		this.logger.Log("nyxclient", map[string]any{"appid": this.appid, "uri": method}, data, map[string]any{"code": code, "consume_t": consume_t, "consume": consume, "data": res, "msg": msg, "time": server_time})
+		this.logger.Log("nyxclient-err", map[string]any{"appid": this.appid, "uri": method}, data, map[string]any{"code": code, "consume_t": consume_t, "consume": consume, "data": res, "msg": msg, "time": server_time})
 	}
 
 	response = &Response{
@@ -319,6 +372,10 @@ func (this *NyxClient) Request(method string, params any, opts ...grpc.CallOptio
 
 	return response, nil
 } //}}}
+
+func (this *NyxClient) Close() {
+	this.logger.Close()
+}
 
 func (this *NyxClient) process(r *pb.ReplyData) (map[string]any, error) { //{{{
 	if r == nil || r.Keys == nil || r.Values == nil {
@@ -343,8 +400,7 @@ func (this *NyxClient) process(r *pb.ReplyData) (map[string]any, error) { //{{{
 	return res, nil
 } // }}}
 
-func (this *NyxClient) getFromCache(method string, data map[string]any) (*cacheData, bool) { // {{{
-	key := []byte(method + strconv.Itoa(int(x.HashMap(data))))
+func (this *NyxClient) getFromCache(key []byte) (*cacheData, bool) { // {{{
 	got, err := this.cache.Get(key)
 
 	if err != nil {
@@ -361,9 +417,7 @@ func (this *NyxClient) getFromCache(method string, data map[string]any) (*cacheD
 	return cache_data, true
 } // }}}
 
-func (this *NyxClient) setCache(method string, data map[string]any, val *cacheData, ttl int) error { // {{{
-	key := []byte(method + strconv.Itoa(int(x.HashMap(data))))
-
+func (this *NyxClient) setCache(key []byte, val *cacheData, ttl int) error { // {{{
 	var buf bytes.Buffer
 	encoder := gob.NewEncoder(&buf)
 	err := encoder.Encode(val)
@@ -375,6 +429,10 @@ func (this *NyxClient) setCache(method string, data map[string]any, val *cacheDa
 
 	return this.cache.Set(key, encodedData, ttl)
 } // }}}
+
+func (this *NyxClient) getCacheKey(method string, data map[string]any) []byte {
+	return []byte(method + strconv.Itoa(int(x.HashMap(data))))
+}
 
 type cacheData struct {
 	Reply   *pb.Reply
